@@ -1,0 +1,154 @@
+name: Build ModernPad6
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-12
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Theos and Legacy SDKs
+        run: |
+          # Переключаемся на старый Xcode, который ещё умеет компилировать 32-битный armv7
+          if [ -d "/Applications/Xcode_13.2.1.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_13.2.1.app/Contents/Developer
+          fi
+          
+          export THEOS=~/theos
+          git clone --recursive https://github.com/theos/theos.git $THEOS
+          
+          # Скачиваем архив со старыми SDK (включая iOS 6 / 7 / 8 с поддержкой armv7)
+          curl -L https://github.com/theos/sdks/archive/master.zip -o sdks.zip
+          unzip -q sdks.zip
+          mv sdks-master/*.sdk $THEOS/sdks/
+
+      - name: Generate Tweak Source Files
+        run: |
+          cat << 'EOF' > Makefile
+          ARCHS = armv7
+          TARGET = iphone:clang:7.1:6.0
+          INSTALL_TARGET_PROCESSES = SpringBoard
+
+          include $(THEOS)/makefiles/common.mk
+
+          TWEAK_NAME = ModernPad6
+          ModernPad6_FILES = Tweak.xm
+          ModernPad6_FRAMEWORKS = UIKit QuartzCore CoreGraphics
+          ModernPad6_CFLAGS = -Wno-deprecated-declarations
+
+          include $(THEOS_MAKE_PATH)/tweak.mk
+          EOF
+
+          cat << 'EOF' > ModernPad6.plist
+          { Filter = { Bundles = ( "com.apple.springboard" ); }; }
+          EOF
+
+          cat << 'EOF' > control
+          Package: com.ruslan.modernpad6
+          Name: ModernPad6
+          Depends: mobilesubstrate, firmware (>= 6.0)
+          Version: 1.0.0
+          Architecture: iphoneos-arm
+          Description: Modern bottom-swipe gestures (Home and Switcher) for iPad mini 1 on iOS 6.
+          Maintainer: Ruslan
+          Author: Ruslan
+          Section: Tweaks
+          EOF
+
+          cat << 'EOF' > Tweak.xm
+          #import <UIKit/UIKit.h>
+
+          @interface SBUIController : NSObject
+          + (id)sharedInstance;
+          - (BOOL)clickedMenuButton;
+          - (void)activateSwitcher;
+          - (BOOL)isSwitcherShowing;
+          - (void)dismissSwitcherAnimated:(BOOL)animated;
+          @end
+
+          static CGPoint startTouchPoint;
+          static BOOL isTrackingBottomSwipe = NO;
+          static BOOL switcherTriggeredDuringHold = NO;
+          static NSTimeInterval touchStartTime;
+
+          %hook SpringBoard
+
+          - (void)sendEvent:(UIEvent *)event {
+              if (event.type == UIEventTypeTouches) {
+                  NSSet *touches = [event allTouches];
+                  if ([touches count] == 1) {
+                      UITouch *touch = [touches anyObject];
+                      UIWindow *window = [UIApplication sharedApplication].keyWindow;
+                      CGPoint location = [touch locationInView:window];
+                      CGSize screenSize = [UIScreen mainScreen].bounds.size;
+                      CGFloat bottomEdge = screenSize.height;
+                      
+                      if (touch.phase == UITouchPhaseBegan) {
+                          if (location.y >= (bottomEdge - 25.0f)) {
+                              isTrackingBottomSwipe = YES;
+                              switcherTriggeredDuringHold = NO;
+                              startTouchPoint = location;
+                              touchStartTime = touch.timestamp;
+                          } else {
+                              isTrackingBottomSwipe = NO;
+                          }
+                      } 
+                      else if (touch.phase == UITouchPhaseMoved && isTrackingBottomSwipe) {
+                          CGFloat deltaY = startTouchPoint.y - location.y;
+                          NSTimeInterval elapsed = touch.timestamp - touchStartTime;
+                          if (deltaY > 110.0f && elapsed > 0.35 && !switcherTriggeredDuringHold) {
+                              switcherTriggeredDuringHold = YES;
+                              SBUIController *uiController = [%c(SBUIController) sharedInstance];
+                              if (![uiController isSwitcherShowing]) {
+                                  [uiController activateSwitcher];
+                              }
+                          }
+                      } 
+                      else if (touch.phase == UITouchPhaseEnded && isTrackingBottomSwipe) {
+                          CGFloat deltaY = startTouchPoint.y - location.y;
+                          if (deltaY > 60.0f && !switcherTriggeredDuringHold) {
+                              SBUIController *uiController = [%c(SBUIController) sharedInstance];
+                              if ([uiController isSwitcherShowing]) {
+                                  [uiController dismissSwitcherAnimated:YES];
+                              } else {
+                                  [uiController clickedMenuButton];
+                              }
+                          }
+                          isTrackingBottomSwipe = NO;
+                          switcherTriggeredDuringHold = NO;
+                      } 
+                      else if (touch.phase == UITouchPhaseCancelled) {
+                          isTrackingBottomSwipe = NO;
+                          switcherTriggeredDuringHold = NO;
+                      }
+                  } else {
+                      isTrackingBottomSwipe = NO;
+                  }
+              }
+              %orig(event);
+          }
+
+          %end
+
+          %hook SBUserPrefs
+          - (BOOL)multitaskingGesturesEnabled {
+              return YES;
+          }
+          %end
+          EOF
+
+      - name: Compile DEB Package
+        run: |
+          export THEOS=~/theos
+          make package FINALPACKAGE=1
+
+      - name: Upload Compiled DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: ModernPad6-deb
+          path: packages/*.deb
+          
